@@ -113,6 +113,7 @@ library(lubridate)
 library(readr)
 library(readxl)
 library(sf)
+library(spdep)
 library(tidyverse)
 ```
 
@@ -206,13 +207,29 @@ contact with those who traveled is the major source of infection. This
 is followed by “Outbreak associated”. Need to find more precisely what
 that means.
 
-Read xlsx file with demographic information and rename column for total
-population:
+Read xlsx file with demographic information and rename columns for
+neighbourhood ID and total population:
 
 ``` r
-toronto_population <- read_excel("wellbeing-toronto-population-total-2011-2016-and-age-groups-2016.xlsx",
-                                 sheet = "2016_Age Groups") %>% 
-  rename(total_population = `Total Population - All Age Groups - 100% data`)
+toronto_population <- read_excel("wellbeing-toronto-population-total-2011-2016-and-age-groups-2016.xlsx", 
+                                 sheet = "016 Pop_TotalChange") %>% 
+  rename(NeighbourhoodID = HoodID,
+         total_population = Pop2016)
+```
+
+Summary of total population:
+
+``` r
+toronto_population %>% 
+  select(total_population) %>% 
+  summary()
+#>  total_population
+#>  Min.   : 6577   
+#>  1st Qu.:12020   
+#>  Median :16750   
+#>  Mean   :19511   
+#>  3rd Qu.:23855   
+#>  Max.   :65913
 ```
 
 Read shape file and rename columns:
@@ -242,8 +259,6 @@ neighbourhoods <- st_read("Neighbourhoods.shp") %>%
 #> geographic CRS: WGS 84
 ```
 
-## Exploratory data analysis
-
 The keys to joining the demographic data to the neighbourhood boundaries
 are the NeighbourhoodID (in the demographic data frame) and
 AREA\_SHORT\_CODE (in the boundaries data frame). Convert those columns
@@ -261,7 +276,8 @@ It is now possible to join the demographic data to the boundaries:
 
 ``` r
  neighbourhoods <- neighbourhoods %>%
-  left_join(toronto_population, by = c("AREA_SHORT_CODE" = "NeighbourhoodID"))
+  left_join(toronto_population, 
+            by = c("AREA_SHORT_CODE" = "NeighbourhoodID"))
 ```
 
 Plot population by neighbourhood:
@@ -276,6 +292,21 @@ ggplot(data = neighbourhoods) +
 ```
 
 ![](README_files/figure-gfm/plot-population-1.png)<!-- -->
+
+Some neighbourhood names are coded differently in the files `COVID19
+cases.csv` and
+`wellbeing-toronto-population-total-2011-2016-and-age-groups-2016.xlsx`
+(I discovered this only later when joining the cases by neighbourhood to
+the population). I will fix this here instead of there:
+
+``` r
+covid19_cases <- covid19_cases %>%
+  mutate(`Neighbourhood Name` = case_when(`Neighbourhood Name` == "Briar Hill - Belgravia" ~ "Briar Hill-Belgravia",
+                                          `Neighbourhood Name` == "Danforth-East York" ~ "Danforth East York",
+                                          TRUE ~ `Neighbourhood Name`))
+```
+
+## Exploratory data analysis: temporal trends
 
 To calculate the number of cases by episode date, we summarize the data
 frame as follows:
@@ -355,6 +386,29 @@ The lag between the episode and report was relatively small in the
 summer, but started increasing again at the end of the summer and
 beginning of the fall.
 
+What has been the average delay between episode and report over time?
+
+``` r
+covid19_cases %>% 
+  transmute(Date = `Reported Date`, 
+            delay = as.numeric(difftime(`Reported Date`, 
+                                        `Episode Date`),
+                               units = "days")) %>%
+  group_by(Date) %>%
+  summarize(mean_delay = mean(delay),
+            .groups = "drop") %>%
+  ggplot(aes(x = Date, y = mean_delay)) +
+  geom_point() + 
+  geom_smooth(method = "loess", formula = y ~ x) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90))
+```
+
+![](README_files/figure-gfm/unnamed-chunk-4-1.png)<!-- -->
+
+The mean delay has remained relatively constant between 5 and 7 days
+throughout the pandemic.
+
 The cumulative incidence can be calculated by dividing the cumulative
 cases by the total population (this is in cases per million people):
 
@@ -368,7 +422,7 @@ The distribution of the cumulative incidence is as follows:
 ``` r
 summary(covid19_cases_by$cumulative_incidence)
 #>     Min.  1st Qu.   Median     Mean  3rd Qu.     Max. 
-#>    0.367 1713.406 4956.127 3922.075 5725.929 7768.567
+#>    0.366 1707.076 4937.818 3907.586 5704.776 7739.868
 ```
 
 For context, according to
@@ -432,14 +486,15 @@ For visualization, I prefer to pivot to long again so that I can use
 aesthetics and facets:
 
 ``` r
-junk <- covid19_cases_by_source_wide %>%
+covid19_cases_by_source <- covid19_cases_by_source_wide %>%
   pivot_longer(!Date,
-               names_to = c(".value", "Source"),
+               names_to = c(".value", 
+                            "Source"),
                names_sep = "_")
 ```
 
 ``` r
-ggplot(data = junk, aes(x = Date, 
+ggplot(data = covid19_cases_by_source, aes(x = Date, 
                         y = cumulative, 
                         fill = Source)) +
   geom_col(position = "stack") +
@@ -447,4 +502,205 @@ ggplot(data = junk, aes(x = Date,
   theme(axis.text.x = element_text(angle = 90))
 ```
 
-![](README_files/figure-gfm/unnamed-chunk-7-1.png)<!-- -->
+![](README_files/figure-gfm/unnamed-chunk-8-1.png)<!-- -->
+
+## Exploratory data analysis: spatial trends
+
+To explore the spatial trends it is first necessary to join the
+neighborhood covid and population data. The data frame with demographic
+information includes a breakdown of population by age group but I will
+only use total population (although it might be interesting to look at
+incidence by age group at some point). I will begin by summarizing the
+cases by date of *episode* (which is the earliest known date that
+someone would have been contagious) and neighbourhood:
+
+``` r
+covid19_cases_by_neighborhood <- covid19_cases %>%
+  rename(Date = `Episode Date`) %>%
+  group_by(Date,
+           `Neighbourhood Name`) %>%
+  summarize(cases = n(),
+            .groups = "drop")
+```
+
+This gives the cases per date per neighbourhood. To calculate the
+cumulative number of cases per neighbourhood I will pivot the table
+wider:
+
+``` r
+covid19_cases_by_neighborhood_wide <- covid19_cases_by_neighborhood %>%
+  pivot_wider(names_from = `Neighbourhood Name`,
+              values_from = cases,
+              names_prefix = "cases_",
+              values_fill = 0)
+```
+
+And then calculate the cumulative sum:
+
+``` r
+covid19_cases_by_neighborhood_wide <- covid19_cases_by_neighborhood_wide %>%
+  mutate(across(starts_with("cases_"),
+                cumsum, 
+                .names = "cumulative.{.col}"))
+```
+
+Now pivot longer again to join the population statistics:
+
+``` r
+covid19_cases_by_neighborhood <- covid19_cases_by_neighborhood_wide %>%
+  pivot_longer(!Date,
+               names_to = c(".value", 
+                            "Neighbourhood"),
+               names_sep = "_") %>%
+  rename(cumulative_cases = cumulative.cases)
+```
+
+Sanity check: what is the number of neighborhoods by date?
+
+``` r
+covid19_cases_by_neighborhood %>% 
+  group_by(Date) %>% 
+  summarize(neighbourhoods = n(),
+            .groups = "drop") %>%
+  summary()
+#>       Date                     neighbourhoods
+#>  Min.   :2020-01-21 00:00:00   Min.   :141   
+#>  1st Qu.:2020-04-15 12:00:00   1st Qu.:141   
+#>  Median :2020-06-12 00:00:00   Median :141   
+#>  Mean   :2020-06-11 13:17:55   Mean   :141   
+#>  3rd Qu.:2020-08-08 12:00:00   3rd Qu.:141   
+#>  Max.   :2020-10-05 00:00:00   Max.   :141
+```
+
+Nice, so all dates have all neighborhoods. Notice that this table is
+actually *longer* than the original `covid19_cases`, and that is because
+the original table did not have records for neighborhoods when there
+were zero cases, so we are now just making those zeros explicit.
+
+Join the population values to the table. The key for this join is the
+`Neighbourhood` on both data frames:
+
+``` r
+covid19_cases_by_neighborhood <- covid19_cases_by_neighborhood %>%
+  left_join(toronto_population %>% 
+              select(NeighbourhoodID,
+                     Neighbourhood,
+                     total_population),
+            by = "Neighbourhood")
+```
+
+At this point, the data frame includes some NA values: those are cases
+not associated with a neighbourhood.
+
+Calculate the cumulative incidence (in cases per million):
+
+``` r
+covid19_cases_by_neighborhood <- covid19_cases_by_neighborhood %>%
+  mutate(cumulative_incidence = cumulative_cases/(total_population/1000000))
+```
+
+What was the spatial distribution of the incidence at various dates? The
+state of emergency in Ontario was declared on March 17, 2020:
+
+``` r
+neighbourhoods %>% 
+  select(AREA_SHORT_CODE) %>%
+  left_join(covid19_cases_by_neighborhood %>% 
+              filter(Date == as.Date("2020-03-17")),
+            by = c("AREA_SHORT_CODE" = "NeighbourhoodID")) %>%
+  ggplot() + 
+  geom_sf(aes(fill = cumulative_incidence)) +
+  scale_fill_distiller(name = "Incidence at March 17",
+                       palette = "YlOrRd", 
+                       direction = 1) +
+  theme_minimal()
+```
+
+![](README_files/figure-gfm/cumulative-incidence-by-neighbourhood-March-17-1.png)<!-- -->
+
+May 19 was when the province moved to Stage 1 of the reopening plan:
+
+``` r
+neighbourhoods %>% 
+  select(AREA_SHORT_CODE) %>%
+  left_join(covid19_cases_by_neighborhood %>% 
+              filter(Date == as.Date("2020-05-19")),
+            by = c("AREA_SHORT_CODE" = "NeighbourhoodID")) %>%
+  ggplot() + 
+  geom_sf(aes(fill = cumulative_incidence)) +
+  scale_fill_distiller(name = "Incidence at May 19",
+                       palette = "YlOrRd", 
+                       direction = 1) +
+  theme_minimal()
+```
+
+![](README_files/figure-gfm/cumulative-incidence-by-neighbourhood-May-19-1.png)<!-- -->
+
+Are the spatial patterns random? We can test the hypothesis of spatial
+independence by means of Moran’s \(I\) coefficient. To implement this I
+need to create a set of spatial weights:
+
+``` r
+neighbourhoods.listw <- poly2nb(as(neighbourhoods, "Spatial")) %>%
+  nb2listw()
+```
+
+Testing for spatial independence at March 17:
+
+``` r
+incidence <- neighbourhoods %>% 
+  select(AREA_SHORT_CODE) %>%
+  left_join(covid19_cases_by_neighborhood %>% 
+              filter(Date == as.Date("2020-03-17")),
+            by = c("AREA_SHORT_CODE" = "NeighbourhoodID")) %>%
+  select(cumulative_incidence) %>%
+  st_drop_geometry()
+
+moran.test(incidence$cumulative_incidence, 
+           neighbourhoods.listw)
+#> 
+#>  Moran I test under randomisation
+#> 
+#> data:  incidence$cumulative_incidence  
+#> weights: neighbourhoods.listw    
+#> 
+#> Moran I statistic standard deviate = 7.4351, p-value = 5.226e-14
+#> alternative hypothesis: greater
+#> sample estimates:
+#> Moran I statistic       Expectation          Variance 
+#>       0.354259608      -0.007194245       0.002363397
+```
+
+Testing for spatial independence at May 19:
+
+``` r
+incidence <- neighbourhoods %>% 
+  select(AREA_SHORT_CODE) %>%
+  left_join(covid19_cases_by_neighborhood %>% 
+              filter(Date == as.Date("2020-05-19")),
+            by = c("AREA_SHORT_CODE" = "NeighbourhoodID")) %>%
+  select(cumulative_incidence) %>%
+  st_drop_geometry()
+
+moran.test(incidence$cumulative_incidence, 
+           neighbourhoods.listw)
+#> 
+#>  Moran I test under randomisation
+#> 
+#> data:  incidence$cumulative_incidence  
+#> weights: neighbourhoods.listw    
+#> 
+#> Moran I statistic standard deviate = 7.7697, p-value = 3.935e-15
+#> alternative hypothesis: greater
+#> sample estimates:
+#> Moran I statistic       Expectation          Variance 
+#>       0.370403404      -0.007194245       0.002361867
+```
+
+We conclude (at a very high level of confidence since \(p < 0.0001\))
+that at these two dates the pattern was likely not random. Moreover, we
+see that what at first glance look like the hot spots at each date are
+in different regions of the city.
+
+Now, how do I organize the data to calculate Moran’s I for all dates?
+And then I will need to calculate the spatial lagged incidence.
