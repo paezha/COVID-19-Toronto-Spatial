@@ -702,5 +702,124 @@ that at these two dates the pattern was likely not random. Moreover, we
 see that what at first glance look like the hot spots at each date are
 in different regions of the city.
 
+## Space-time dynamics
+
 Now, how do I organize the data to calculate Moran’s I for all dates?
 And then I will need to calculate the spatial lagged incidence.
+
+Pivot cases by neighborhood wide but now the columns will be dates:
+
+``` r
+covid19_cases_by_neighborhood_wide <- covid19_cases_by_neighborhood %>% 
+  select(Date, NeighbourhoodID, cumulative_cases) %>%
+  pivot_wider(id_cols = NeighbourhoodID, names_from = Date, values_from = cumulative_cases)
+```
+
+Join to the `sf` object (it is *very* important that the neighbourhoods
+in the wide table are sorted in the same order as the neighbourhoods in
+the `sf` object since the `sf` object was used to create the adjacency
+matrix; if not sorted in the same order, the values will not correspond
+to the right spatial adjacency patterns):
+
+``` r
+neighbourhoods <- neighbourhoods %>%
+  left_join(covid19_cases_by_neighborhood_wide, 
+            by = c("AREA_SHORT_CODE" = "NeighbourhoodID"))
+```
+
+Calculate Moran’s I using `lapply()`:
+
+``` r
+# Select columns to be used in the calculation of Moran's I test
+mi <- neighbourhoods %>% 
+  select(starts_with("2020")) %>% 
+  st_drop_geometry() 
+
+# Retrieve dates
+episode_dates = colnames(mi)
+
+# Use lapply to calculate the test; the value will be a list
+mi <- mi %>%
+  lapply(moran.test, listw = neighbourhoods.listw)
+```
+
+Once that tests have been computed, extract the main results from the
+list for visualization:
+
+``` r
+# Initialize data frame to store results of test
+mi_test <- data.frame(mi[[1]][[3]])
+
+# Extract results of test and place in data frame
+for(i in 2:length(mi)){
+  mi_test <- cbind(mi_test, mi[[i]][[3]])
+}
+
+# Convert to data frame including the dates
+mi_test <- t(mi_test) %>%
+  as.data.frame() %>%
+  transmute(Date = ymd(episode_dates), I = `Moran I statistic`, Expectation, Variance)
+```
+
+Calculate the 95% interval of confidence:
+
+``` r
+mi_test <- mi_test %>%
+  mutate(CI_low = Expectation - 1.96 * sqrt(Variance/nrow(neighbourhoods)),
+         CI_high = Expectation + 1.96 * sqrt(Variance/nrow(neighbourhoods)))
+```
+
+Plot resuls of the test with expectation and interval of confidence:
+
+``` r
+ggplot(data = mi_test, 
+       aes(x = Date)) + 
+  geom_point(aes(y = I)) +
+  geom_ribbon(aes(ymin = CI_low, 
+                  ymax = CI_high), 
+              fill = "red", 
+              alpha = 0.2) + 
+  geom_line(aes(y = Expectation), 
+            color = "red") 
+```
+
+![](README_files/figure-gfm/unnamed-chunk-14-1.png)<!-- -->
+
+Except for the very early dates, the pattern has consistently been
+outside of the 95% confidence interval, that is, we can comfortably
+reject the null hypothesis of spatial independence. As we saw in the
+examples before, the pattern suggests positive autocorrelation, with
+geographical concentrations of high incidence values, as would be
+expected of a process of contagion.
+
+To further study the space-time dynamics, I need to calculate the
+spatially lagged variable. Use `across()`?
+
+``` r
+
+junk <- neighbourhoods %>% st_drop_geometry() %>%
+  transmute(across(starts_with("2020-"), ~lag.listw(neighbourhoods.listw, .x), .names = "(.col)_lag"))
+```
+
+``` r
+lagged_vars <- lag.listw(neighbourhoods.listw, 
+                         neighbourhoods %>% 
+                           st_drop_geometry() %>%
+                           select(which(colnames(neighbourhoods) == episode_dates[1])) %>%
+                           pull())
+for(i in 2:length(episode_dates)){
+  lagged_vars <- cbind(lagged_vars,
+                       lag.listw(neighbourhoods.listw, 
+                         neighbourhoods %>% 
+                           st_drop_geometry() %>%
+                           select(which(colnames(neighbourhoods) == episode_dates[i])) %>%
+                           pull()))
+}
+
+lagged_vars <- data.frame(lagged_vars)
+
+colnames(lagged_vars) <- episode_dates
+```
+
+My next problem is organizing all the variables and lags to calculate
+the transition probabilities.
